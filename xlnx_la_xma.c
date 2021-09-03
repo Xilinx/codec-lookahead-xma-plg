@@ -290,7 +290,6 @@ static int32_t xma_alloc_mem_res(XmaFilterSession *sess)
                                                ctx->lookahead_depth + 1, input_size, 0);
         if ((memRes->pool == (XvbmPoolHandle)-1) ||
                 (memRes->pool == NULL)) {
-            printf("%s : xvbm_buffer_pool_create failed\n", __func__);
             xma_logmsg(XMA_ERROR_LOG, XMA_LA_PLUGIN,
                        "xvbm_buffer_pool_create: %p : FAILED!!", ctx);
             cleanup_krnl_driver_thread(sess);
@@ -722,7 +721,7 @@ static void write_dev_buf_to_file(xlnx_la_t *ctx, xlnx_la_buf_t *buf)
     }
     memset(buf->pHost, 0, buf->size);
     if (xvbm_buffer_read(buf->xvbmBuf, buf->pHost, buf->size, 0)) {
-        printf("write_dev_buf_to_file: Failed to read device side buffer!!\n");
+        fprintf(stderr, "write_dev_buf_to_file: Failed to read device side buffer!!\n");
         return;
     }
     fwrite(buf->pHost, buf->size, 1, ctx->inFile);
@@ -827,7 +826,8 @@ static xlnx_thread_func_ret_t run_hw(XmaFilterSession *sess)
     xma_plg_schedule_work_item(xma_sess, ctx->ctrl,
                                MOT_EST_CTRL_SIZE, &ret);
     if (ret != XMA_SUCCESS) {
-        printf("failed schedule request sent to XRT = %d\n", ret);
+        xma_logmsg(XMA_DEBUG_LOG, XMA_LA_PLUGIN,
+                   "failed to schedule work item, err= %d\n", ret);
         return ERetError;
     }
     xma_logmsg(XMA_DEBUG_LOG, XMA_LA_PLUGIN, "%p : Krnl Started %p", ctx,
@@ -997,7 +997,6 @@ static int send_frame_to_device(xlnx_la_t *ctx,
     if(!b_handle) {
         xma_logmsg(XMA_ERROR_LOG, XMA_LA_PLUGIN,
                    "send_frame_to_device no buffer in xvbm pool");
-        printf("Error: (%s) Buffer Pool full - no free buffer available\n", __func__);
         return XMA_ERROR;
     }
     labuf->xvbmBuf = b_handle;
@@ -1115,8 +1114,6 @@ static int extend_input_bufpool(XvbmBufferHandle b_handle,
     xma_logmsg(XMA_DEBUG_LOG, XMA_LA_PLUGIN,
                "LA plg Request to extend LA input pool(%d) by %d buffers", num,
                extension_count);
-    printf("LA plg Request to extend LA input pool(%d) by %d buffers\n", num,
-           extension_count);
     /* TODO: if the incoming pool is shared between multiple instances,
        the the pool is extended multiple times. Need to add a proper check to avoid this.
     */
@@ -1124,8 +1121,6 @@ static int extend_input_bufpool(XvbmBufferHandle b_handle,
     if (cnt != num + extension_count) {
         xma_logmsg(XMA_ERROR_LOG, XMA_LA_PLUGIN,
                    "OOM: LA plg Failed to extend LA input pool by %d buffers", extension_count);
-        printf("Error : OOM: LA plg Failed to extend LA input pool by %d buffers\n",
-               extension_count);
         return XMA_ERROR;
     }
     return XMA_SUCCESS;
