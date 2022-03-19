@@ -31,6 +31,7 @@ typedef struct spatial_qpmap
 } spatial_qpmap_t;
 
 xlnx_spatial_aq_t xlnx_spatial_create(aq_config_t *cfg);
+void update_aq_gain(xlnx_spatial_aq_t sp, aq_config_t *cfg);
 void xlnx_spatial_destroy(xlnx_spatial_aq_t sp);
 xlnx_status xlnx_spatial_gen_qpmap(xlnx_spatial_aq_t sp,
                                    const uint32_t *var_energy_map, const uint16_t *act_energy_map,

@@ -106,8 +106,9 @@ typedef struct spatial_cfg
     uint32_t blockWidth;
     uint32_t blockHeight;
     uint32_t la_depth;
-    uint32_t spatial_aq_mode;
-    float spatial_aq_gain;
+    uint32_t dyn_frame_num;
+    uint32_t spatial_aq_mode[XLNX_DEFAULT_LA_DEPTH + 1];
+    float spatial_aq_gain[XLNX_DEFAULT_LA_DEPTH + 1];
     uint32_t num_mb;
     uint32_t qpmap_size;
 } spatial_cfg_t;
@@ -118,6 +119,23 @@ typedef struct xlnx_spatial_ctx
     xlnx_queue free_map_q;
     xlnx_queue ready_map_q;
 } xlnx_spatial_ctx_t;
+
+void update_aq_gain(xlnx_spatial_aq_t sp, aq_config_t *cfg)
+{
+    xlnx_spatial_ctx_t *ctx = (xlnx_spatial_ctx_t *)sp;
+    spatial_cfg_t *mycfg = &ctx->cfg;
+    mycfg->spatial_aq_mode[mycfg->dyn_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)] = 
+                                                          cfg->spatial_aq_mode;
+
+    if (mycfg->height < 720) {
+        mycfg->spatial_aq_gain[mycfg->dyn_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)] = 1;
+    } else {
+        mycfg->spatial_aq_gain[mycfg->dyn_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)] = 
+                                          (float)(3.0 * cfg->spatial_aq_gain)/100;
+    }
+    mycfg->dyn_frame_num++;
+    return;
+}
 
 static void copy_config(xlnx_spatial_ctx_t *ctx, aq_config_t *cfg)
 {
@@ -133,12 +151,16 @@ static void copy_config(xlnx_spatial_ctx_t *ctx, aq_config_t *cfg)
     mycfg->blockWidth = cfg->blockWidth;
     mycfg->blockHeight = cfg->blockHeight;
     mycfg->la_depth = cfg->la_depth;
-    mycfg->spatial_aq_mode = cfg->spatial_aq_mode;
-    if (mycfg->height < 720) {
-        mycfg->spatial_aq_gain = 1;
-    } else {
-        mycfg->spatial_aq_gain = (float)(3.0 * cfg->spatial_aq_gain)/100;
+
+    for(int32_t i = 0; i < (XLNX_DEFAULT_LA_DEPTH + 1); i++) {
+        mycfg->spatial_aq_mode[i] = cfg->spatial_aq_mode;
+        if (mycfg->height < 720) {
+            mycfg->spatial_aq_gain[i] = 1;
+        } else {
+            mycfg->spatial_aq_gain[i] = (float)(3.0 * cfg->spatial_aq_gain)/100;
+        }
     }
+    mycfg->dyn_frame_num = 0;
     mycfg->num_mb = cfg->num_mb;
     mycfg->qpmap_size = cfg->qpmap_size;
 }
@@ -146,11 +168,6 @@ static void copy_config(xlnx_spatial_ctx_t *ctx, aq_config_t *cfg)
 xlnx_spatial_aq_t xlnx_spatial_create(aq_config_t *cfg)
 {
     uint32_t numL1Lcu;
-    if (cfg->spatial_aq_mode == 0) {
-        xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS, "%s spatial_aq_mode = 0",
-                   __FUNCTION__);
-        return NULL;
-    }
     xlnx_spatial_ctx_t *ctx = calloc(1, sizeof(xlnx_spatial_ctx_t));
     if (!ctx) {
         xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS, "%s OOM",
@@ -225,11 +242,9 @@ xlnx_status xlnx_spatial_gen_qpmap(xlnx_spatial_aq_t sp,
 
     int block_width = cfg->blockWidth;
     int div_factor = (block_width*block_width)/4;
-    uint32_t aq_mode = cfg->spatial_aq_mode;
+    uint32_t aq_mode = cfg->spatial_aq_mode[frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)];
     *frame_activity = 0;
-    if (aq_mode == 0) {
-        return EXlnxError;
-    }
+
     //Handle EOS
     if (((aq_mode == XLNX_AQ_SPATIAL_AUTOVARIANCE) && !var_energy_map) ||
             ((aq_mode == XLNX_AQ_SPATIAL_ACTIVITY) && !frame_activity)) {
@@ -243,7 +258,7 @@ xlnx_status xlnx_spatial_gen_qpmap(xlnx_spatial_aq_t sp,
 
     int i_mb_stride = i_padded_mb_width;
     int actual_mb_count =  i_actual_mb_width * i_actual_mb_height;
-    float f_aq_strength = cfg->spatial_aq_gain;
+    float f_aq_strength = cfg->spatial_aq_gain[frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)];
     int i_aq_prev_frame_enable = 0;
 
     spatial_qpmap_t smap;
@@ -270,8 +285,6 @@ xlnx_status xlnx_spatial_gen_qpmap(xlnx_spatial_aq_t sp,
                     energy = var_energy_map[(i_padded_mb_width*mb_y) + mb_x];
                     qp_adj = (x264_log2( X264_MAX(energy/div_factor,
                                                   1))*2)/5; //powf( energy * bit_depth_correction*mul_factor + 1, 0.125f );
-                } else {
-                    assert(0);
                 }
                 spatial_aq_map[mb_x + mb_y*i_mb_stride] = qp_adj;
                 avg_adj += qp_adj;
@@ -304,13 +317,10 @@ xlnx_status xlnx_spatial_gen_qpmap(xlnx_spatial_aq_t sp,
             //printf("prev avg_adj=%f, avg_adj_pow2=%f h->actual_mb_count=%d\n",avg_adj, avg_adj_pow2, h->actual_mb_count);
             //avg_adj = avg_adj - 0.5f * (avg_adj_pow2 - modeTwoConst) / avg_adj;
             //printf("avg_adj=%f, avg_adj_pow2=%f h->actual_mb_count=%d\n",avg_adj, avg_adj_pow2, h->actual_mb_count);
-        } else {
-            assert(0);
         }
     } else {
-        //printf("Error : Unsupported mode\n");
         PushQ(ctx->free_map_q, &smap);
-        return EXlnxError;
+        return EXlnxSuccess;
     }
 
     for( int mb_y = 0; mb_y < i_actual_mb_height; mb_y++ ) {
@@ -343,9 +353,6 @@ xlnx_status xlnx_spatial_gen_qpmap(xlnx_spatial_aq_t sp,
                 } else if(qp_adj<-10.0f) {
                     qp_adj = -10.0f;
                 }
-            } else {
-                PushQ(ctx->free_map_q, &smap);
-                assert(0);
             }
 
             /*if( quant_offsets ) {

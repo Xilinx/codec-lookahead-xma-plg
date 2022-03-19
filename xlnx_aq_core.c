@@ -69,7 +69,7 @@ typedef struct xlnx_ap_dump_ctx
 
 typedef struct xlnx_aq_core_ctx
 {
-    aq_config_t cfg;
+    aq_config_t *cfg;
     uint64_t accumulatedSadFrames;
     uint8_t isDeltaQpMapLAPending;
     uint32_t *collocatedSadLA;
@@ -78,10 +78,18 @@ typedef struct xlnx_aq_core_ctx
     uint32_t write_idx;
     uint32_t read_idx;
     xlnx_tp_qpmap_t *laMapCtx;
-    uint32_t spatial_aq_mode;
-    uint32_t temporal_aq_mode;
+    uint32_t spatial_aq_mode[XLNX_DEFAULT_LA_DEPTH + 1];
+    uint32_t temporal_aq_mode[XLNX_DEFAULT_LA_DEPTH + 1];
+    uint32_t in_frame_num;
+    uint32_t out_frame_num;
+    uint32_t dyn_frame_num;
     uint32_t rate_control_mode;
+    uint32_t num_b_frames[XLNX_DEFAULT_LA_DEPTH + 1];
+    uint32_t init_b_frames;
+    uint32_t prev_p;
     uint32_t num_mb;
+    uint32_t lastIntraFrame;
+    uint32_t nextIntraFrame;
     uint8_t qpmaps_enabled;
     xlnx_rc_aq_t rc_h;
     xlnx_spatial_aq_t sp_h;
@@ -278,6 +286,31 @@ static int32_t dump_frame_delta_qp_map(xlnx_aq_dump_t handle,
     return 0;
 }
 
+static void init_aq_modes(xlnx_aq_core_ctx_t *ctx, aq_config_t *cfg)
+{
+
+    for(int32_t i = 0; i < (XLNX_DEFAULT_LA_DEPTH + 1); i++) {
+        ctx->spatial_aq_mode[i] = cfg->spatial_aq_mode;
+        ctx->temporal_aq_mode[i] = cfg->temporal_aq_mode;
+    }
+    ctx->in_frame_num = 0;
+    ctx->out_frame_num = 0;
+    ctx->dyn_frame_num = 0;
+    return;
+}
+
+void update_aq_modes(xlnx_aq_core_t handle, aq_config_t *cfg)
+{
+    xlnx_aq_core_ctx_t *ctx = (xlnx_aq_core_ctx_t *)handle;
+    ctx->spatial_aq_mode[ctx->dyn_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)] = cfg->spatial_aq_mode;
+    ctx->temporal_aq_mode[ctx->dyn_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)] = cfg->temporal_aq_mode;
+    ctx->num_b_frames[ctx->dyn_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)] = cfg->num_b_frames;
+
+    update_aq_gain(ctx->sp_h, cfg);
+    ctx->dyn_frame_num++;
+    return;
+}
+
 xlnx_aq_core_t create_aq_core(aq_config_t *cfg, xlnx_aq_dump_cfg *dumpCfg)
 {
     uint32_t numL1Lcu;
@@ -285,19 +318,19 @@ xlnx_aq_core_t create_aq_core(aq_config_t *cfg, xlnx_aq_dump_cfg *dumpCfg)
     if (!ctx) {
         return NULL;
     }
-    ctx->cfg = *cfg;
+    ctx->cfg = cfg;
     ctx->num_mb = cfg->num_mb;
     numL1Lcu = ctx->num_mb + 1;
     ctx->isDeltaQpMapLAPending = 1;
-    ctx->spatial_aq_mode = cfg->spatial_aq_mode;
-    ctx->temporal_aq_mode = cfg->temporal_aq_mode;
+    init_aq_modes(ctx, cfg);
     ctx->rate_control_mode = cfg->rate_control_mode;
     ctx->codec_type = cfg->codec_type;
-    if (ctx->spatial_aq_mode || ctx->temporal_aq_mode) {
-        ctx->qpmaps_enabled = 1;
-    } else {
-        ctx->qpmaps_enabled = 0;
+    ctx->qpmaps_enabled = 1;
+    for(int32_t i = 0; i < (XLNX_DEFAULT_LA_DEPTH + 1); i++) {
+        ctx->num_b_frames[i] = cfg->num_b_frames;
     }
+    ctx->init_b_frames = cfg->num_b_frames;
+    ctx->prev_p = 0;
     ctx->rc_h = NULL;
     ctx->sp_h = NULL;
     ctx->qpStore = NULL;
@@ -312,57 +345,49 @@ xlnx_aq_core_t create_aq_core(aq_config_t *cfg, xlnx_aq_dump_cfg *dumpCfg)
             return NULL;
         }
     }
-    if (ctx->temporal_aq_mode) {
-        ctx->collocatedSadLA = malloc(sizeof(uint32_t)*numL1Lcu);
-        if (!ctx->collocatedSadLA) {
-            destroy_aq_core(ctx);
-            xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS, "%s OOM", __FUNCTION__);
-            return NULL;
-        }
-        memset(ctx->collocatedSadLA, 0, sizeof(uint32_t)*numL1Lcu);
-        ctx->qpStore = create_qp_map_store(cfg);
-        if (!ctx->qpStore) {
-            destroy_aq_core(ctx);
-            xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS, "%s OOM", __FUNCTION__);
-            return NULL;
-        }
-        if ((ctx->codec_type == EXlnxHevc) && (ctx->tmp_hevc_map == NULL)) {
-            ctx->tmp_hevc_map = calloc(1, sizeof(int32_t) * cfg->qpmap_size);
-            if (ctx->tmp_hevc_map == NULL) {
-                destroy_aq_core(ctx);
-                xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS, "%s OOM", __FUNCTION__);
-                return NULL;
-            }
-        }
-        ctx->read_idx = 1;
-        ctx->write_idx = 1;
-        ctx->laMapCtx = get_qp_map_at(ctx->qpStore, 0);
-    } else {
-        ctx->read_idx = 0;
-        ctx->write_idx = 0;
-        ctx->laMapCtx = NULL;
+    ctx->collocatedSadLA = malloc(sizeof(uint32_t)*numL1Lcu);
+    if (!ctx->collocatedSadLA) {
+        destroy_aq_core(ctx);
+        xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS, "%s OOM", __FUNCTION__);
+        return NULL;
     }
+    memset(ctx->collocatedSadLA, 0, sizeof(uint32_t)*numL1Lcu);
+    ctx->qpStore = create_qp_map_store(cfg);
+    if (!ctx->qpStore) {
+        destroy_aq_core(ctx);
+        xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS, "%s OOM", __FUNCTION__);
+        return NULL;
+    }
+    if ((ctx->codec_type == EXlnxHevc) && (ctx->tmp_hevc_map == NULL)) {
+        ctx->tmp_hevc_map = calloc(1, sizeof(int32_t) * cfg->qpmap_size);
+        if (ctx->tmp_hevc_map == NULL) {
+            destroy_aq_core(ctx);
+            xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS, "%s OOM", __FUNCTION__);
+            return NULL;
+        }
+    }
+    ctx->read_idx = 1;
+    ctx->write_idx = 1;
+    ctx->laMapCtx = get_qp_map_at(ctx->qpStore, 0);
 
     if (dumpCfg) {
         ctx->dump_handle = create_aq_dump_handle(dumpCfg, cfg);
     } else {
         ctx->dump_handle = NULL;
     }
-    if (ctx->spatial_aq_mode != 0) {
-        ctx->sp_h = xlnx_spatial_create(cfg);
-        if (ctx->sp_h == NULL) {
+    ctx->sp_h = xlnx_spatial_create(cfg);
+    if (ctx->sp_h == NULL) {
+        destroy_aq_core(ctx);
+        xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS, "%s xlnx_spatial_create Failed",
+                    __FUNCTION__);
+        return NULL;
+    }
+    if ((ctx->codec_type == EXlnxHevc) && (ctx->tmp_hevc_map == NULL)) {
+        ctx->tmp_hevc_map = calloc(1, sizeof(int32_t) * cfg->qpmap_size);
+        if (ctx->tmp_hevc_map == NULL) {
             destroy_aq_core(ctx);
-            xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS, "%s xlnx_spatial_create Failed",
-                       __FUNCTION__);
+            xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS, "%s OOM", __FUNCTION__);
             return NULL;
-        }
-        if ((ctx->codec_type == EXlnxHevc) && (ctx->tmp_hevc_map == NULL)) {
-            ctx->tmp_hevc_map = calloc(1, sizeof(int32_t) * cfg->qpmap_size);
-            if (ctx->tmp_hevc_map == NULL) {
-                destroy_aq_core(ctx);
-                xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS, "%s OOM", __FUNCTION__);
-                return NULL;
-            }
         }
     }
 
@@ -419,7 +444,7 @@ static inline int getFrameSad(xlnx_aq_core_ctx_t *ctx,  const uint16_t *sadIn,
         return -1;
     }
     uint32_t frame_sad = 0;
-    aq_config_t *cfg = &ctx->cfg;
+    aq_config_t *cfg = ctx->cfg;
     uint32_t blockWidth = cfg->blockWidth;
     uint32_t blockHeight = cfg->blockHeight;
     int32_t outWidth = cfg->outWidth;
@@ -455,7 +480,7 @@ static int32_t xlnx_temporal_gen_qpmap(xlnx_aq_core_ctx_t *ctx,
     int32_t *deltaQpMap = NULL;
 
 
-    aq_config_t *cfg = &ctx->cfg;
+    aq_config_t *cfg = ctx->cfg;
     uint32_t blockWidth = cfg->blockWidth;
     uint32_t blockHeight = cfg->blockHeight;
     int32_t outWidth = cfg->outWidth;
@@ -464,7 +489,6 @@ static int32_t xlnx_temporal_gen_qpmap(xlnx_aq_core_ctx_t *ctx,
     xlnx_tp_qpmap_t *xlnx_tp_qpmap_t = outMapCtx;
 
     uint32_t numL1Lcu = ctx->num_mb+1;
-    uint32_t lastIntra = (frame_num/intraPeriod)*intraPeriod;
     const uint16_t *sad = sadIn;
     *frameSAD = 0;
 
@@ -501,15 +525,47 @@ static int32_t xlnx_temporal_gen_qpmap(xlnx_aq_core_ctx_t *ctx,
     maxBlockDistance = (maxBlockDistance == 0)? 1: maxBlockDistance;
 
     uint32_t minQp, maxQp;
-    uint32_t pFrameFreq = cfg->num_b_frames + 1;
-    // GOP based AQ weights here
-    if((frame_num-lastIntra)%pFrameFreq ==0) {
+    uint32_t num_b_frames = ctx->num_b_frames[frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)];
+    uint32_t prev_b_frames = ctx->num_b_frames[(frame_num - 1)%(XLNX_DEFAULT_LA_DEPTH + 1)];
+
+    /* If number of B frames changes at run time, need to adjust the previous 
+       P frame accordingly for correct P and B frame prediction. VCU encoder 
+       always buffers initial B frames and when number of B frame changes, it
+       applies from the immediate sub GOP instead of the sub GOP that follows 
+       the frame number at which the user changes B frames. */
+
+    /* Example: Initial B frames is 4, user changes to 1 B frame at frame 100.
+       When 100th frame is given to the encoder, it is yet to encode 96th frame.
+       Since the sub GOP ends at 95th frame(P frame), it applies new B frame 
+       changes from 96th frame encoding 96 as B, 97 as P and so on. */
+    if(prev_b_frames != num_b_frames) {
+        uint32_t enc_gop_frame = frame_num - (ctx->init_b_frames + 1);
+
+        if(enc_gop_frame != ctx->prev_p) {
+            /* The below loop updates the previous P frame according to the 
+               encoder current state */
+            while((ctx->prev_p - (prev_b_frames + 1)) >= enc_gop_frame) {
+                ctx->prev_p -= (prev_b_frames + 1);
+            }
+        }
+
+        /* Adjust the prev_p closest to the frame number based on new sub GOP */
+        while((ctx->prev_p + (num_b_frames + 1)) < frame_num) {
+            ctx->prev_p += (num_b_frames + 1);
+        }
+    }
+
+    /* Adjust the previous P for new GOP structure */
+    if((frame_num == 0) || ((frame_num - ctx->prev_p) == (num_b_frames + 1)) ||
+      (frame_num == ctx->nextIntraFrame)) {
         minQp = 6;
         maxQp = 3;
+        ctx->prev_p = frame_num;
     } else {
         minQp = 2;
         maxQp = 2;
     }
+
     uint32_t dndx =0;
     int32_t diffSad;
     deltaQpMap = (int32_t *)xlnx_tp_qpmap_t->qpmap.ptr;
@@ -530,7 +586,7 @@ static int32_t xlnx_temporal_gen_qpmap(xlnx_aq_core_ctx_t *ctx,
         }
     }
 
-    if (((frame_num%intraPeriod) != 0)) {
+    if (frame_num != ctx->nextIntraFrame) {
         xlnx_tp_qpmap_t->inUse = 1;
         xlnx_tp_qpmap_t->frame_num = frame_num;
     }
@@ -553,7 +609,7 @@ static int32_t xlnx_temporal_gen_la_qpmap(xlnx_aq_core_ctx_t *ctx,
     int32_t tmp_qp = 0;
     uint32_t minLaBlockSad, maxLaBlockSad;
     int32_t minLaDistance, maxLaDistance;
-    aq_config_t *cfg = &ctx->cfg;
+    aq_config_t *cfg = ctx->cfg;
     uint32_t blockWidth = cfg->blockWidth;
     uint32_t blockHeight = cfg->blockHeight;
     int32_t outWidth = cfg->outWidth;
@@ -636,7 +692,7 @@ void merge_qp_maps(xlnx_aq_core_ctx_t *ctx, int32_t *temporal_qpmap,
                    uint32_t num_mb,
                    uint8_t *out_map)
 {
-    aq_config_t *cfg = &ctx->cfg;
+    aq_config_t *cfg = ctx->cfg;
     uint32_t padded_w = cfg->padded_mb_w;
     uint32_t actual_w = cfg->actual_mb_w;
     int32_t temporal = 0;
@@ -693,7 +749,7 @@ void merge_qp_maps_hevc(xlnx_aq_core_ctx_t *ctx, int32_t *temporal_qpmap,
                         uint32_t num_mb,
                         uint8_t *out_map)
 {
-    aq_config_t *cfg = &ctx->cfg;
+    aq_config_t *cfg = ctx->cfg;
     uint32_t padded_w = cfg->padded_mb_w;
     uint32_t actual_w = cfg->actual_mb_w;
     uint32_t actual_h = cfg->actual_mb_h;
@@ -778,13 +834,12 @@ static xlnx_status generateQPMap(xlnx_aq_core_t handle, uint64_t frame_num,
                                  const uint32_t *var_energy_map, const uint16_t *act_energy_map,
                                  uint32_t isLastFrame,
                                  uint32_t *frame_activity,
-                                 uint32_t *frame_sad)
+                                 uint32_t *frame_sad, int32_t is_idr)
 {
     xlnx_status ret_status = EXlnxSuccess;
 
     xlnx_aq_core_ctx_t *ctx = (xlnx_aq_core_ctx_t *)handle;
-    aq_config_t *cfg = &ctx->cfg;
-    uint32_t intraPeriod = cfg->intraPeriod;
+    aq_config_t *cfg = ctx->cfg;
     xlnx_tp_qpmap_t *laMapCtx = ctx->laMapCtx;
     xma_logmsg(XMA_DEBUG_LOG, XMA_XLNX_ALGOS,
                "%s IN frame_num=%lu sadIn=%p var_energy_map=%p act_energy_map=%p isLastFrame=%u",
@@ -794,16 +849,12 @@ static xlnx_status generateQPMap(xlnx_aq_core_t handle, uint64_t frame_num,
 
     uint32_t numL1Lcu = ctx->num_mb+1;
     xlnx_tp_qpmap_t *xlnx_tp_qpmap_t = NULL;
-    //float *spatial_map = NULL;
     uint8_t isIntraFrame = 0;
-    uint32_t isTemporalEnabled = (ctx->temporal_aq_mode == XLNX_AQ_TEMPORAL_LINEAR);
-    if (isTemporalEnabled) {
-        if((frame_num % intraPeriod) == 0) {
-            isIntraFrame = 1;
-        }
+    if(frame_num == ctx->nextIntraFrame) {
+        isIntraFrame = 1;
     }
 
-    if (ctx->sp_h) {
+    if (ctx->spatial_aq_mode[ctx->in_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)]) {
         ret_status = xlnx_spatial_gen_qpmap(ctx->sp_h, var_energy_map, act_energy_map,
                                             frame_num, frame_activity);
         if (ret_status != EXlnxSuccess) {
@@ -812,67 +863,90 @@ static xlnx_status generateQPMap(xlnx_aq_core_t handle, uint64_t frame_num,
             return ret_status;
         }
     }
-    if (isTemporalEnabled) {
-        if (sadIn) {
-            xlnx_tp_qpmap_t = get_qp_map_at(ctx->qpStore, ctx->write_idx);
-            if (xlnx_tp_qpmap_t->inUse == 1) {
-                xma_logmsg(XMA_DEBUG_LOG, XMA_XLNX_ALGOS, "%s Input SAD Q is full",
-                           __FUNCTION__);
-                return EXlnxTryAgain;
-            }
 
-            if ((frame_num % intraPeriod) == 0) {
-                ctx->isDeltaQpMapLAPending = 1;
-                assert(laMapCtx->inUse == 0);
-                laMapCtx->frame_num = (frame_num/intraPeriod)*intraPeriod;
-                memset(ctx->collocatedSadLA, 0, sizeof(uint32_t)*numL1Lcu);
-            }
-            xma_logmsg(XMA_DEBUG_LOG, XMA_XLNX_ALGOS,
-                       "%s frame_num=%lu ctx->isDeltaQpMapLAPending=%u", __FUNCTION__,
-                       frame_num, ctx->isDeltaQpMapLAPending);
-
-            if (xlnx_temporal_gen_qpmap(ctx, sadIn, frame_num, frame_sad,
-                                        xlnx_tp_qpmap_t)) {
-                return EXlnxTryAgain;
-            }
-            if(isIntraFrame == 0) {
-                ctx->write_idx++;
-                if (ctx->write_idx >= (cfg->la_depth+1)) {
-                    ctx->write_idx = 1;
-                }
-            }
-            ctx->accumulatedSadFrames += *frame_sad;
+    /* Dynamic IDR insertion check. Make sure not to redo the QP map 
+    calculation when GOP period and IDR insertion occurs at same frame */
+    if(sadIn && !isIntraFrame && is_idr) {
+        ctx->nextIntraFrame = frame_num;
+        if((frame_num - ctx->lastIntraFrame) < cfg->la_depth) {
+            xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS,
+                        "%s: Multiple Intra/IDR frames within LA depth is not supported",
+                        __FUNCTION__);
+            return EXlnxError;
         }
-        xma_logmsg(XMA_DEBUG_LOG, XMA_XLNX_ALGOS,
-                   "%s frame_num=%lu isDeltaQpMapLAPending=%u distance=%lu isLastFrame=%u",
-                   __FUNCTION__, frame_num, ctx->isDeltaQpMapLAPending,
-                   (frame_num % intraPeriod), isLastFrame);
-
-        if((frame_num && (((frame_num % intraPeriod) + 1) == cfg->la_depth)) ||
-                ((cfg->la_depth == 1) && (frame_num == 1))
-                || isLastFrame ||
-                (sadIn == NULL)) {
-            if(ctx->isDeltaQpMapLAPending) {
-                if (laMapCtx->frame_num != (frame_num/intraPeriod)*intraPeriod) {
-                    xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS,
-                               "%s Expected Intra map = %lu does not match =%lu", __FUNCTION__,
-                               laMapCtx->frame_num, (frame_num/intraPeriod)*intraPeriod);
-                    return EXlnxError;
-                }
-                xma_logmsg(XMA_DEBUG_LOG, XMA_XLNX_ALGOS, "%s Dump I %lu", __FUNCTION__,
-                           laMapCtx->frame_num);
-                xlnx_temporal_gen_la_qpmap(ctx, laMapCtx);
-                laMapCtx->inUse = 1;
-                ctx->isDeltaQpMapLAPending = 0;
-            }
+        /* Memset collocated SAD buffer to 0 to start accumulating SAD for 
+            IDR frames */
+        if(((frame_num - ctx->lastIntraFrame) + 1) > cfg->la_depth) {
+            memset(ctx->collocatedSadLA, 0, sizeof(uint32_t)*numL1Lcu);
+            laMapCtx->frame_num = frame_num;
+            ctx->isDeltaQpMapLAPending = 1;
         }
     }
+
+    if (sadIn) {
+        xlnx_tp_qpmap_t = get_qp_map_at(ctx->qpStore, ctx->write_idx);
+        if (xlnx_tp_qpmap_t->inUse == 1) {
+            xma_logmsg(XMA_DEBUG_LOG, XMA_XLNX_ALGOS, "%s Input SAD Q is full",
+                        __FUNCTION__);
+            return EXlnxTryAgain;
+        }
+
+        if (isIntraFrame) {
+            ctx->isDeltaQpMapLAPending = 1;
+            assert(laMapCtx->inUse == 0);
+            laMapCtx->frame_num = frame_num;
+            memset(ctx->collocatedSadLA, 0, sizeof(uint32_t)*numL1Lcu);
+        }
+        xma_logmsg(XMA_DEBUG_LOG, XMA_XLNX_ALGOS,
+                    "%s frame_num=%lu ctx->isDeltaQpMapLAPending=%u", __FUNCTION__,
+                    frame_num, ctx->isDeltaQpMapLAPending);
+
+        if (xlnx_temporal_gen_qpmap(ctx, sadIn, frame_num, frame_sad,
+                                    xlnx_tp_qpmap_t)) {
+            return EXlnxTryAgain;
+        }
+        /* Update previous and next intra frame for every GOP period */
+        if(isIntraFrame || is_idr) {
+            ctx->nextIntraFrame = frame_num + cfg->intraPeriod;
+            ctx->lastIntraFrame = frame_num;
+        } else {
+            ctx->write_idx++;
+            if (ctx->write_idx >= (cfg->la_depth+1)) {
+                ctx->write_idx = 1;
+            }
+        }
+        ctx->accumulatedSadFrames += *frame_sad;
+    }
+    xma_logmsg(XMA_DEBUG_LOG, XMA_XLNX_ALGOS,
+                "%s frame_num=%lu isDeltaQpMapLAPending=%u distance=%lu isLastFrame=%u",
+                __FUNCTION__, frame_num, ctx->isDeltaQpMapLAPending,
+        (frame_num - ctx->lastIntraFrame), isLastFrame);
+
+    if((frame_num && (((frame_num - ctx->lastIntraFrame) + 1) == cfg->la_depth)) ||
+            ((cfg->la_depth == 1) && (frame_num == 1))
+            || isLastFrame ||
+            (sadIn == NULL)) {
+        if(ctx->isDeltaQpMapLAPending) {
+            if (laMapCtx->frame_num != ctx->lastIntraFrame) {
+                xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS,
+                            "%s Expected Intra map = %lu does not match =%lu", __FUNCTION__,
+                            laMapCtx->frame_num, ctx->lastIntraFrame);
+                return EXlnxError;
+            }
+            xma_logmsg(XMA_DEBUG_LOG, XMA_XLNX_ALGOS, "%s Dump I %lu", __FUNCTION__,
+                        laMapCtx->frame_num);
+            xlnx_temporal_gen_la_qpmap(ctx, laMapCtx);
+            laMapCtx->inUse = 1;
+            ctx->isDeltaQpMapLAPending = 0;
+        }
+    }
+
     return EXlnxSuccess;
 }
 
 xlnx_status send_frame_stats(xlnx_aq_core_t handle, uint64_t frame_num,
                              xlnx_frame_stats *stats,
-                             uint32_t isLastFrame)
+                             uint32_t isLastFrame, int32_t is_idr)
 {
     xlnx_aq_core_ctx_t *ctx = (xlnx_aq_core_ctx_t *)handle;
     const uint16_t *sadIn = NULL;
@@ -887,28 +961,26 @@ xlnx_status send_frame_stats(xlnx_aq_core_t handle, uint64_t frame_num,
         actIn = stats->act;
     }
     xlnx_status ret = EXlnxSuccess;
-    if (ctx->qpmaps_enabled) {
-        ret = generateQPMap(handle, frame_num, sadIn, varIn, actIn, isLastFrame,
-                            &frame_activity, &frame_sad);
-        if (ret != EXlnxSuccess && stats && !isLastFrame) {
-            return ret;
-        }
+    ret = generateQPMap(handle, frame_num, sadIn, varIn, actIn, isLastFrame,
+                        &frame_activity, &frame_sad, is_idr);
+    if (ret != EXlnxSuccess && stats && !isLastFrame) {
+        return ret;
     }
 
     if (ctx->rc_h) {
         if (sadIn && actIn) {
             xlnx_rc_fsfa_t fsfa;
-            if (ctx->temporal_aq_mode == XLNX_AQ_TEMPORAL_LINEAR) {
+            if (ctx->temporal_aq_mode[ctx->in_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)] == XLNX_AQ_TEMPORAL_LINEAR) {
                 fsfa.fs = frame_sad;
             } else {
                 if (getFrameSad(ctx, sadIn, &fsfa.fs)) {
                     return ret;
                 }
             }
-            if (ctx->spatial_aq_mode == XLNX_AQ_SPATIAL_ACTIVITY) {
+            if (ctx->spatial_aq_mode[ctx->in_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)] == XLNX_AQ_SPATIAL_ACTIVITY) {
                 fsfa.fa = frame_activity;
             } else {
-                if (xlnx_spatial_frame_activity(&ctx->cfg, actIn, &fsfa.fa)) {
+                if (xlnx_spatial_frame_activity(ctx->cfg, actIn, &fsfa.fa)) {
                     return ret;
                 }
             }
@@ -922,6 +994,8 @@ xlnx_status send_frame_stats(xlnx_aq_core_t handle, uint64_t frame_num,
             ret = xlnx_algo_rc_write_fsfa(ctx->rc_h, NULL);
         }
     }
+    ctx->in_frame_num++;
+
     return ret;
 }
 
@@ -1010,15 +1084,7 @@ static xlnx_status copy_fsfa(xlnx_rc_aq_t rc,
             xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS, "%s RC algo failed",  __FUNCTION__);
             return EXlnxError;
         }
-        if (dstVQInfo->qpmap.ptr) {
-            if (dstVQInfo->frame_num != rc_frame_num) {
-                xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS,
-                           "Warning : RC frame number(%lu) is not same as qpmap number(%lu)",
-                           rc_frame_num, dstVQInfo->frame_num);
-            }
-        } else {
-            dstVQInfo->frame_num = rc_frame_num;
-        }
+        dstVQInfo->frame_num = rc_frame_num;
     }
     return EXlnxSuccess;
 }
@@ -1049,27 +1115,28 @@ static int all_qpmaps_available(xlnx_aq_core_ctx_t *ctx)
     int sp_ready = 1;
     int tp_ready = 1;
 
-    if (ctx->sp_h) {
+    if (ctx->spatial_aq_mode[ctx->out_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)]) {
         sp_ready = xlnx_spatial_is_ready(ctx->sp_h);
     }
-    uint32_t isTemporalEnabled = ctx->temporal_aq_mode == XLNX_AQ_TEMPORAL_LINEAR;
-    if (isTemporalEnabled) {
-        tp_ready = xlnx_temporal_is_ready(ctx);
-    }
+
+    tp_ready = xlnx_temporal_is_ready(ctx);
     if (!sp_ready || !tp_ready) {
         ret = 0;
     }
     return ret;
 }
 
-xlnx_status recv_frame_aq_info(xlnx_aq_core_t handle, xlnx_aq_info_t *vqInfo)
+xlnx_status recv_frame_aq_info(xlnx_aq_core_t handle, xlnx_aq_info_t *vqInfo, 
+                               uint64_t frame_num, int32_t is_idr)
 {
     xlnx_aq_core_ctx_t *ctx = (xlnx_aq_core_ctx_t *)handle;
-    aq_config_t *cfg = &ctx->cfg;
+    aq_config_t *cfg = ctx->cfg;
     uint64_t frameNumI, frameNumP;
     uint32_t is_available;
     int32_t iPending;
     int32_t pPending;
+    uint32_t numL1Lcu = ctx->num_mb+1;
+    uint8_t iframe_sent = 0;
 
     if (ctx->rc_h) {
         if (xlnx_algo_rc_fsfa_available(ctx->rc_h) == 0) {
@@ -1077,66 +1144,83 @@ xlnx_status recv_frame_aq_info(xlnx_aq_core_t handle, xlnx_aq_info_t *vqInfo)
         }
     }
 
-    if (ctx->qpmaps_enabled) {
-        if (all_qpmaps_available(ctx) == 0) {
-            return EXlnxTryAgain;
+    if (all_qpmaps_available(ctx) == 0) {
+        return EXlnxTryAgain;
+    }
+    xlnx_status qp_status = EXlnxSuccess;
+    spatial_qpmap_t s_qpmap;
+    s_qpmap.fPtr = NULL;
+
+    if (ctx->spatial_aq_mode[ctx->out_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)]) {
+        qp_status = xlnx_spatial_recv_qpmap(ctx->sp_h, &s_qpmap);
+        if (qp_status != EXlnxSuccess) {
+            xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS, "%s Spatial qpmap not available",
+                        __FUNCTION__
+                        );
         }
-        xlnx_status qp_status = EXlnxSuccess;
-        spatial_qpmap_t s_qpmap;
-        s_qpmap.fPtr = NULL;
-        if (ctx->sp_h) {
-            qp_status = xlnx_spatial_recv_qpmap(ctx->sp_h, &s_qpmap);
-            if (qp_status != EXlnxSuccess) {
-                xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS, "%s Spatial qpmap not available",
-                           __FUNCTION__
-                          );
-            }
-        }
-        xlnx_tp_qpmap_t *t_qpmap = NULL;
-        uint32_t isTemporalEnabled = ctx->temporal_aq_mode == XLNX_AQ_TEMPORAL_LINEAR;
-        if (isTemporalEnabled) {
-            iPending = is_qp_map_pending(ctx, EIType, &frameNumI, &is_available);
-            if (iPending && is_available) {
-                t_qpmap = ctx->laMapCtx;
-                pPending = is_qp_map_pending(ctx, EPType, &frameNumP, &is_available);
-                if (pPending && is_available) {
-                    if (frameNumP < frameNumI) {
-                        t_qpmap = get_qp_map_at(ctx->qpStore, ctx->read_idx);
-                        ctx->read_idx++;
-                        if (ctx->read_idx >= (cfg->la_depth + 1)) {
-                            ctx->read_idx = 1;
-                        }
-                        xma_logmsg(XMA_DEBUG_LOG, XMA_XLNX_ALGOS, "%s OUT P available", __FUNCTION__
-                                  );
-                    }
-                }
-            } else {
+    }
+    xlnx_tp_qpmap_t *t_qpmap = NULL;
+    iPending = is_qp_map_pending(ctx, EIType, &frameNumI, &is_available);
+    if (iPending && is_available) {
+        t_qpmap = ctx->laMapCtx;
+        pPending = is_qp_map_pending(ctx, EPType, &frameNumP, &is_available);
+        if (pPending && is_available) {
+            if (frameNumP < frameNumI) {
                 t_qpmap = get_qp_map_at(ctx->qpStore, ctx->read_idx);
                 ctx->read_idx++;
                 if (ctx->read_idx >= (cfg->la_depth + 1)) {
                     ctx->read_idx = 1;
                 }
                 xma_logmsg(XMA_DEBUG_LOG, XMA_XLNX_ALGOS, "%s OUT P available", __FUNCTION__
-                          );
+                            );
             }
+            else
+                iframe_sent = 1;
         }
+        else
+            iframe_sent = 1;
+    } else {
+        t_qpmap = get_qp_map_at(ctx->qpStore, ctx->read_idx);
+        ctx->read_idx++;
+        if (ctx->read_idx >= (cfg->la_depth + 1)) {
+            ctx->read_idx = 1;
+        }
+        xma_logmsg(XMA_DEBUG_LOG, XMA_XLNX_ALGOS, "%s OUT P available", __FUNCTION__);
+    }
 
+    if(!ctx->temporal_aq_mode[ctx->out_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)]) {
+        t_qpmap->inUse = 0;
+        t_qpmap = NULL;
+    }
+
+    if (ctx->spatial_aq_mode[ctx->out_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)] ||
+        ctx->temporal_aq_mode[ctx->out_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)]) {
         qp_status = copy_qpmaps(ctx, vqInfo, t_qpmap, &s_qpmap, ctx->num_mb);
-        if (t_qpmap) {
-            t_qpmap->inUse = 0;
-        }
-        if (ctx->sp_h) {
-            xlnx_spatial_release_qpmap(ctx->sp_h, &s_qpmap);
-        }
-        if (qp_status != EXlnxSuccess) {
-            xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS, "%s qpmap generation status = %d",
-                       __FUNCTION__, qp_status);
-            return qp_status;
-        }
         if (ctx->dump_handle) {
             dump_frame_delta_qp_map(ctx->dump_handle, vqInfo->qpmap.ptr, vqInfo->qpmap.size,
                                     vqInfo->frame_num, 0);
         }
+    } else {
+        memset(vqInfo->qpmap.ptr, 0, vqInfo->qpmap.size);
     }
+
+    if (t_qpmap) {
+        t_qpmap->inUse = 0;
+    }
+    if (ctx->spatial_aq_mode[ctx->out_frame_num%(XLNX_DEFAULT_LA_DEPTH + 1)]) {
+        xlnx_spatial_release_qpmap(ctx->sp_h, &s_qpmap);
+    }
+    if (qp_status != EXlnxSuccess) {
+        xma_logmsg(XMA_ERROR_LOG, XMA_XLNX_ALGOS, "%s qpmap generation status = %d",
+                    __FUNCTION__, qp_status);
+        return qp_status;
+    }
+
+    /* Updating next intra frame number for LA map. This has been introduced 
+       to handle dynamic IDR insertions */
+    if(iframe_sent) {
+        ctx->laMapCtx->frame_num = ctx->lastIntraFrame;
+    }
+    ctx->out_frame_num++;
     return copy_fsfa(ctx->rc_h, vqInfo);
 }

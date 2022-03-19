@@ -17,12 +17,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
+#include <pthread.h>
 #include "xlnx_la_xma.h"
 #include "xlnx_la_plg_ext.h"
 #include "krnl_mot_est_hw.h"
 #include "xlnx_la_defines.h"
 
 #define XMA_LA_PLUGIN "XMA_LA_PLUGIN"
+
+#define LOCK_CFG pthread_mutex_lock(&ctx->cfg_lock)
+#define UNLOCK_CFG pthread_mutex_unlock(&ctx->cfg_lock)
+
 static const char *outFilePath = "delta_qpmap";
 static const uint32_t KERNEL_WAIT_TIMEOUT = 1000; //msec
 static const char *XLNX_LA_EXT_PARAMS[] = {
@@ -73,15 +78,23 @@ static int32_t init_krnl_regs(XmaFilterSession *sess)
 {
     xlnx_la_t *ctx = sess->base.plugin_data;
     xma_logmsg(XMA_DEBUG_LOG, XMA_LA_PLUGIN,
-               "%p Set Krnl Regs width=%u height=%u stride=%u write_mv=%u "
+               "%p Set Krnl Regs width=%u height=%u stride=%u bpc_mode=%u write_mv=%u "
                "skip_l2=%u", ctx,
-               ctx->width, ctx->height, ctx->stride, ctx->write_mv, ctx->skip_l2);
+               ctx->width, ctx->height, ctx->vcu_aligned_width, ctx->bpc_mode, ctx->write_mv,
+               ctx->skip_l2);
 
-    memcpy (ctx->ctrl + ADDR_WIDTH_DATA, &(ctx->width), sizeof(uint32_t));
-    memcpy (ctx->ctrl + ADDR_HEIGHT_DATA, &(ctx->height), sizeof(uint32_t));
-    memcpy (ctx->ctrl + ADDR_STRIDE_DATA, &(ctx->stride), sizeof(uint32_t));
-    memcpy (ctx->ctrl + ADDR_WRITE_MV_DATA, &(ctx->write_mv), sizeof(uint32_t));
-    memcpy (ctx->ctrl + ADDR_SKIP_L2_DATA, &(ctx->skip_l2), sizeof(uint32_t));
+    memcpy (ctx->ctrl + XV_MOT_EST_CTRL_ADDR_WIDTH_DATA, &(ctx->width),
+            sizeof(uint32_t));
+    memcpy (ctx->ctrl + XV_MOT_EST_CTRL_ADDR_HEIGHT_DATA, &(ctx->height),
+            sizeof(uint32_t));
+    memcpy (ctx->ctrl + XV_MOT_EST_CTRL_ADDR_STRIDE_DATA, &(ctx->vcu_aligned_width),
+            sizeof(uint32_t));
+    memcpy (ctx->ctrl + XV_MOT_EST_CTRL_ADDR_WRITE_MV_DATA, &(ctx->write_mv),
+            sizeof(uint32_t));
+    memcpy (ctx->ctrl + XV_MOT_EST_CTRL_ADDR_SKIP_L2_DATA, &(ctx->skip_l2),
+            sizeof(uint32_t));
+    memcpy (ctx->ctrl + XV_MOT_EST_CTRL_ADDR_PIXFMT_DATA, &(ctx->bpc_mode),
+            sizeof(uint32_t));
 
     return 0;
 }
@@ -95,15 +108,14 @@ static int32_t xma_alloc_vq_info_buffer(xlnx_la_t *ctx, xlnx_aq_info_t *vq_info)
     uint8_t *fsfa_buf = NULL;
     qpmap->ptr = NULL;
     fsfa->ptr = NULL;
-    if ((ctx->spatial_aq_mode != 0) || (ctx->temporal_aq_mode != 0)) {
-        qpmap_buf = calloc(1, sizeof(uint8_t) * ctx->qpmap_out_size);
-        if(!qpmap_buf) {
-            xma_logmsg(XMA_ERROR_LOG, XMA_LA_PLUGIN, "OOM %s !!", __FUNCTION__);
-            return XMA_ERROR;
-        }
-        qpmap->ptr = qpmap_buf;
-        qpmap->size = sizeof(uint8_t) * ctx->qpmap_out_size;
+
+    qpmap_buf = calloc(1, sizeof(uint8_t) * ctx->qpmap_out_size);
+    if(!qpmap_buf) {
+        xma_logmsg(XMA_ERROR_LOG, XMA_LA_PLUGIN, "OOM %s !!", __FUNCTION__);
+        return XMA_ERROR;
     }
+    qpmap->ptr = qpmap_buf;
+    qpmap->size = sizeof(uint8_t) * ctx->qpmap_out_size;
 
     if (ctx->rate_control_mode != 0) {
         fsfa_buf = calloc(1, sizeof(xlnx_rc_fsfa_t) * ctx->lookahead_depth);
@@ -230,9 +242,20 @@ static int32_t xma_alloc_mem_res(XmaFilterSession *sess)
     memRes->cur_in_buf = NULL;
 
     ctx->vcu_aligned_height = xlnx_align_to_base(ctx->height, VCU_HEIGHT_ALIGN);
-    ctx->vcu_aligned_width = xlnx_align_to_base(ctx->stride, VCU_STRIDE_ALIGN);
-    unsigned int input_size = (ctx->vcu_aligned_width) * (ctx->vcu_aligned_height)
-                              * (3) / (2);
+
+    if (ctx->bpc_mode == EBPCMode8) {
+        ctx->vcu_aligned_width = xlnx_align_to_base(ctx->in_stride, VCU_STRIDE_ALIGN);
+    } else if (ctx->bpc_mode == EBPCMode10) {
+        ctx->vcu_aligned_width = xlnx_align_to_base(((ctx->width+2)/3) << 2,
+                                 VCU_STRIDE_ALIGN);
+    } else {
+        xma_logmsg(XMA_ERROR_LOG, XMA_LA_PLUGIN,
+                   "%p : Invalid BPC mode=%d", ctx->bpc_mode);
+        return XMA_ERROR;
+    }
+    unsigned int input_size = ((ctx->vcu_aligned_width) * (ctx->vcu_aligned_height)
+                               * 3) >> 1;
+
     size_t output_size = setOutBufSize(ctx, memRes, &ctx->use_out_length);
     //printf("LA : %p input_size=%u output_size=%u\n", ctx, input_size, output_size);
 
@@ -418,15 +441,13 @@ static int32_t init_qpmap_generator(XmaFilterSession *sess)
 
 static int32_t check_la_settings(xlnx_la_t *ctx)
 {
-    if (!ctx->temporal_aq_mode && !ctx->spatial_aq_mode &&
-            !ctx->rate_control_mode) {
+    if (ctx->in_frame_format == XMA_VCU_NV12_10LE32_FMT_TYPE &&
+            !ctx->enableHwInBuf) {
         xma_logmsg(XMA_ERROR_LOG, XMA_LA_PLUGIN,
-                   "check_la_settings: Invalid Params spatial_aq_mode = %u, temporal mode = %u, rate_control_mode = %u",
-                   ctx->spatial_aq_mode,
-                   ctx->temporal_aq_mode,
-                   ctx->rate_control_mode);
+                   "check_la_settings: XMA_VCU_NV12_10LE32_FMT_TYPE supported only in Zero-copy mode");
         return -1;
     }
+
     if ((ctx->lookahead_depth == 0) && (ctx->temporal_aq_mode > 0)) {
         xma_logmsg(XMA_ERROR_LOG, XMA_LA_PLUGIN,
                    "check_la_settings: Invalid Params lookahead_depth = %u, temporal mode = %u",
@@ -454,13 +475,14 @@ static int32_t xma_la_init(XmaFilterSession *sess)
     XmaParameter *extParam = NULL;
     uint32_t pc = 0;
 
-    if ((filter_props->input.format != XMA_YUV420_FMT_TYPE) &&
-            (filter_props->input.format != XMA_VCU_NV12_FMT_TYPE)
+    if ((filter_props->input.format != XMA_VCU_NV12_FMT_TYPE) &&
+            (filter_props->input.format != XMA_VCU_NV12_10LE32_FMT_TYPE)
        ) {
         xma_logmsg(XMA_ERROR_LOG, XMA_LA_PLUGIN,
                    "xma_la_init: input Format %d not supported", filter_props->input.format);
         return -1;
     }
+    ctx->in_frame_format = filter_props->input.format;
     syslog(LOG_DEBUG, "xma_la_handle = %p\n", ctx);
     clock_gettime (CLOCK_REALTIME, &ctx->latency);
     ctx->time_taken = (ctx->latency.tv_sec * 1e3) + (ctx->latency.tv_nsec / 1e6);
@@ -471,7 +493,18 @@ static int32_t xma_la_init(XmaFilterSession *sess)
 
     ctx->width = filter_props->input.width;
     ctx->height = filter_props->input.height;
-    ctx->stride = filter_props->input.stride;
+    ctx->in_stride = filter_props->input.stride;
+
+    if (filter_props->input.bits_per_pixel == 8) {
+        ctx->bpc_mode = EBPCMode8;
+    } else if (filter_props->input.bits_per_pixel == 10) {
+        ctx->bpc_mode = EBPCMode10;
+    } else {
+        xma_logmsg(XMA_ERROR_LOG, XMA_LA_PLUGIN,
+                   "xma_la_init: bits_per_pixel = %u Invalid", filter_props->input.bits_per_pixel);
+        return XMA_ERROR;
+    }
+
     ctx->in_frame = 0;
     ctx->out_frame = 0;
     ctx->write_mv = 0;
@@ -667,6 +700,13 @@ static int32_t xma_la_init(XmaFilterSession *sess)
 
     ctx->eos_received = 0;
     ctx->inEOS = 0;
+
+    if (pthread_mutex_init(&ctx->cfg_lock, NULL) < 0) {
+        xma_logmsg(XMA_ERROR_LOG, XMA_LA_PLUGIN,
+                   "Init: Failed to create mutex lock");
+        return -1;
+    }
+
     ctx->krnl_thread = xlnx_thread_create();
     xlnx_thread_param paramStart;
     paramStart.func = krnl_driver;
@@ -797,34 +837,38 @@ static xlnx_thread_func_ret_t run_hw(XmaFilterSession *sess)
         memRes->ref_in_buf = memRes->cur_in_buf;
     }
     xma_logmsg(XMA_DEBUG_LOG, XMA_LA_PLUGIN,
-               "%p : Set Krnl Regs ADDR_FRM_BUFFER_SRCH_V_DATA=%lx ADDR_FRM_BUFFER_REF_V_DATA=%lx out=%lx xma_sess=%p",
+               "%p : Set Krnl Regs XV_MOT_EST_CTRL_ADDR_FRM_BUFFER_SRCH_V_DATA=%lx XV_MOT_EST_CTRL_ADDR_FRM_BUFFER_REF_V_DATA=%lx out=%lx xma_sess=%p",
                ctx,
                memRes->ref_in_buf->paddr, memRes->cur_in_buf->paddr,
                ctx->stats_buf.paddr,
                xma_sess);
 
-    memcpy (ctx->ctrl + ADDR_FRM_BUFFER_SRCH_V_DATA,
+    memcpy (ctx->ctrl + XV_MOT_EST_CTRL_ADDR_FRM_BUFFER_SRCH_V_DATA,
             &(memRes->ref_in_buf->paddr),
             sizeof(uint64_t));
-    memcpy (ctx->ctrl + ADDR_FRM_BUFFER_REF_V_DATA,
+    memcpy (ctx->ctrl + XV_MOT_EST_CTRL_ADDR_FRM_BUFFER_REF_V_DATA,
             &(memRes->cur_in_buf->paddr),
             sizeof(uint64_t));
-    memcpy (ctx->ctrl + ADDR_SAD_V_DATA, &(ctx->stats_buf.paddr),
+    memcpy (ctx->ctrl + XV_MOT_EST_CTRL_ADDR_SAD_V_DATA, &(ctx->stats_buf.paddr),
             sizeof(uint64_t));
 
     paddr = ctx->stats_buf.paddr + memRes->mv_off;
-    memcpy (ctx->ctrl + ADDR_MV_V_DATA, &paddr, sizeof(uint64_t));
+    memcpy (ctx->ctrl + XV_MOT_EST_CTRL_ADDR_MV_V_DATA, &paddr, sizeof(uint64_t));
     paddr = ctx->stats_buf.paddr + memRes->var_off;
-    memcpy (ctx->ctrl + ADDR_VAR_V_DATA, &paddr, sizeof(uint64_t));
+    memcpy (ctx->ctrl + XV_MOT_EST_CTRL_ADDR_VAR_V_DATA, &paddr, sizeof(uint64_t));
     paddr = ctx->stats_buf.paddr + memRes->act_off;
-    memcpy (ctx->ctrl + ADDR_ACT_V_DATA, &paddr, sizeof(uint64_t));
+    memcpy (ctx->ctrl + XV_MOT_EST_CTRL_ADDR_ACT_V_DATA, &paddr, sizeof(uint64_t));
+
+    // set stride
+    memcpy (ctx->ctrl + XV_MOT_EST_CTRL_ADDR_STRIDE_DATA, &(ctx->vcu_aligned_width),
+            sizeof(uint32_t));
 
     /* Schedule execution of lookahead kernel */
     xma_logmsg(XMA_DEBUG_LOG, XMA_LA_PLUGIN, "%p : START Krnl %p", ctx,
                xma_sess);
 //    TH_RET_IF_ERR(xma_plg_schedule_work_item, hw_sess);
     xma_plg_schedule_work_item(xma_sess, ctx->ctrl,
-                               MOT_EST_CTRL_SIZE, &ret);
+                               XV_MOT_EST_CTRL_SIZE, &ret);
     if (ret != XMA_SUCCESS) {
         xma_logmsg(XMA_DEBUG_LOG, XMA_LA_PLUGIN,
                    "failed to schedule work item, err= %d\n", ret);
@@ -836,7 +880,7 @@ static xlnx_thread_func_ret_t run_hw(XmaFilterSession *sess)
     return ERetRunAgain;
 }
 
-static void pump_out_qpmaps(xlnx_la_t *ctx)
+static void pump_out_qpmaps(xlnx_la_t *ctx, uint64_t frame_num)
 {
     xlnx_aq_info_t vqInfo;
     xlnx_la_mem_res_t *memRes = &ctx->la_bufs;
@@ -851,7 +895,9 @@ static void pump_out_qpmaps(xlnx_la_t *ctx)
                 return;
             }
         }
-        algo_status = recv_frame_aq_info(ctx->qp_handle, &vqInfo);
+        //algo_status = recv_frame_aq_info(ctx->qp_handle, &vqInfo);
+        algo_status = recv_frame_aq_info(ctx->qp_handle, &vqInfo, frame_num,
+                                         ctx->is_idr);
         if (EXlnxSuccess == algo_status) {
             xma_logmsg(XMA_DEBUG_LOG, XMA_LA_PLUGIN,
                        "%p : pump_out_qpmaps Push out generated vq info of frame = %lu", ctx,
@@ -884,18 +930,17 @@ static void set_frame_stats(xlnx_la_t *ctx, xlnx_frame_stats *stats,
     stats->act = NULL;
     stats->num_blocks = ctx->num_mb;
     stats->mv = NULL;
-    if (ctx->spatial_aq_mode == XLNX_AQ_SPATIAL_AUTOVARIANCE) {
-        stats->var = var;
-    } else if (ctx->spatial_aq_mode == XLNX_AQ_SPATIAL_ACTIVITY) {
+
+    stats->var = var;
+    if (ctx->spatial_aq_mode == XLNX_AQ_SPATIAL_ACTIVITY) {
         stats->act = act;
     }
+
     if (ctx->rate_control_mode) {
         stats->act = act;
     }
-    if (ctx->temporal_aq_mode == XLNX_AQ_TEMPORAL_LINEAR ||
-            ctx->rate_control_mode) {
-        stats->sad = sad;
-    }
+
+    stats->sad = sad;
 }
 
 static xlnx_thread_func_ret_t process_last_output(XmaFilterSession *sess)
@@ -914,8 +959,10 @@ static xlnx_thread_func_ret_t process_last_output(XmaFilterSession *sess)
             set_frame_stats(ctx, &stats, NULL,
                             NULL,
                             NULL, NULL);
-            send_frame_stats(ctx->qp_handle, ctx->frame_num+1, NULL, 1);
-            pump_out_qpmaps(ctx);
+            if(send_frame_stats(ctx->qp_handle, ctx->frame_num+1, NULL, 1, ctx->is_idr) == EXlnxError) {
+                return ERetError;
+            }
+            pump_out_qpmaps(ctx, ctx->frame_num+1);
             return ERetDone;
         } else {
             return ERetRunAgain;
@@ -936,9 +983,11 @@ static xlnx_thread_func_ret_t process_last_output(XmaFilterSession *sess)
                     (uint16_t *)host_buf,
                     (uint32_t *)(host_buf + memRes->var_off),
                     (uint16_t *)(host_buf + memRes->act_off), NULL);
-    send_frame_stats(ctx->qp_handle, ctx->frame_num, &stats,
-                     isLastFrameStat);
-    pump_out_qpmaps(ctx);
+    if(send_frame_stats(ctx->qp_handle, ctx->frame_num, &stats,
+                     isLastFrameStat, ctx->is_idr) == EXlnxError) {
+        return ERetError;
+    }
+    pump_out_qpmaps(ctx, ctx->frame_num);
     ctx->frame_num++;
     PushQ(memRes->freeStatsBufQ, &last_stats_buf);
 
@@ -975,77 +1024,91 @@ static xlnx_thread_func_ret_t wait_for_hw(XmaFilterSession *sess)
 
     memRes->ref_in_buf = memRes->cur_in_buf;
 
+    ctx->is_idr = 0;
+    if(ctx->frame_num > 0) {
+        ctx->is_idr = memRes->cur_in_buf->xFrame.is_idr;
+    }
+
     PushQ(memRes->readyStatsBufQ, &ctx->stats_buf);
     memRes->cur_in_buf = NULL;
 
     return ERetRunAgain;
 }
 
-static int send_frame_to_device(xlnx_la_t *ctx,
-                                xlnx_la_buf_t *labuf, XmaFrame *frame)
+static int send_frame_to_device(xlnx_la_t *ctx, xlnx_la_buf_t *labuf,
+                                XmaFrame *frame)
 {
-    uint8_t *src, *dst;
-    size_t size_y, size_uv;
-    int16_t dst_stride, dst_height;
-    int16_t src_stride;
-    int ret = 0;
-    int i;
-
     xlnx_la_mem_res_t *memRes = &ctx->la_bufs;
-
     XvbmBufferHandle b_handle = xvbm_buffer_pool_entry_alloc(memRes->pool);
     if(!b_handle) {
-        xma_logmsg(XMA_ERROR_LOG, XMA_LA_PLUGIN,
-                   "send_frame_to_device no buffer in xvbm pool");
+        xma_logmsg(XMA_ERROR_LOG, XMA_LA_PLUGIN, "Error: (%s) Buffer Pool full - "
+                   "no free buffer available", __func__);
         return XMA_ERROR;
     }
-    labuf->xvbmBuf = b_handle;
-    labuf->pHost = (uint8_t *)xvbm_buffer_get_host_ptr(b_handle);
-    dst_stride = ctx->vcu_aligned_width;
-    dst_height = ctx->vcu_aligned_height;
+    uint8_t *device_buffer = (uint8_t *)xvbm_buffer_get_host_ptr(b_handle);
+    uint8_t *src_buffer;
+    uint16_t src_bytes_in_line  = frame->frame_props.linesize[0];
+    uint16_t dev_bytes_in_line  = ctx->vcu_aligned_width;
+    uint16_t src_height         = frame->frame_props.height;
+    uint16_t dev_height         = ctx->vcu_aligned_height;
+    size_t dev_y_size           = dev_bytes_in_line * dev_height;
+    int ret                     = XMA_ERROR;
 
-    size_y   = ((size_t)dst_stride * dst_height);
-    size_uv  = size_y >> 1;
-
-    if ((frame->frame_props.linesize[0] != (int32_t)dst_stride) ||
-            (frame->frame_props.height      != dst_height)) {
-        src_stride = frame->frame_props.linesize[0];
-
-        //PLANE_Y
-        src = (uint8_t *)frame->data[0].buffer;
-        dst = labuf->pHost;
-
-        //copy pixel data
-        for(i = 0; i < frame->frame_props.height; ++i) {
-            memcpy(dst, src, frame->frame_props.width);
-            src += src_stride;
-            dst += dst_stride;
+    if (src_bytes_in_line != dev_bytes_in_line) {
+        uint16_t dev_rows_in_plane = dev_height;
+        uint16_t src_rows_in_plane = src_height;
+        int16_t stride_delta = dev_bytes_in_line - src_bytes_in_line;
+        int16_t height_delta = dev_rows_in_plane - src_rows_in_plane;
+        size_t dev_index = 0;
+        for (int plane_id = 0; plane_id < xma_frame_planes_get(&frame->frame_props);
+                plane_id++) {
+            size_t src_index = 0;
+            src_buffer = (uint8_t *)frame->data[plane_id].buffer;
+            if(plane_id > 0) {
+                dev_rows_in_plane = dev_height / 2;
+                src_rows_in_plane = src_height / 2;
+                height_delta = dev_rows_in_plane - src_rows_in_plane;
+            }
+            for(uint16_t h = 0; h < src_rows_in_plane && h < dev_rows_in_plane; h++) {
+                for(uint16_t w = 0; w < src_bytes_in_line && w < dev_bytes_in_line; w++) {
+                    device_buffer[dev_index] = src_buffer[src_index];
+                    src_index++;
+                    dev_index++;
+                }
+                if(stride_delta > 0) {
+                    dev_index += stride_delta;
+                } else {
+                    src_index += -1 * stride_delta; // src > dev (higher alignment)
+                }
+            }
+            if(height_delta > 0) {
+                dev_index += dev_bytes_in_line * height_delta;
+            } // No else necessary because src_index resets.
         }
-
-        //PLANE_UV
-        src = (uint8_t *)frame->data[1].buffer;
-        dst = labuf->pHost;
-        dst += size_y;
-        src_stride = frame->frame_props.linesize[1];
-
-        for(i = 0; i < frame->frame_props.height/2; ++i) {
-            memcpy(dst, src, frame->frame_props.width);
-            src += src_stride;
-            dst += dst_stride;
-        }
+        XLNX_TL_START(ctx->dma_tl);
+        ret = xvbm_buffer_write(b_handle, device_buffer,
+                                (3 * dev_y_size) >> 1, 0);
+        XLNX_TL_PAUSE(ctx->dma_tl);
     } else {
-        dst = labuf->pHost;
-        memcpy(dst, frame->data[0].buffer, size_y);
-        dst += size_y;
-        memcpy(dst, frame->data[1].buffer, size_uv);
+        size_t src_y_size = src_bytes_in_line * src_height;
+        XLNX_TL_START(ctx->dma_tl);
+        ret = xvbm_buffer_write(b_handle, frame->data[0].buffer, src_y_size, 0);
+        if (!ret) {
+            ret = xvbm_buffer_write(b_handle, frame->data[1].buffer, src_y_size >> 1,
+                                    dev_y_size);
+        }
+        XLNX_TL_PAUSE(ctx->dma_tl);
     }
-    XLNX_TL_START(ctx->dma_tl);
-    ret = xvbm_buffer_write(b_handle,
-                            xvbm_buffer_get_host_ptr(b_handle),
-                            (size_y+size_uv), 0);
-    XLNX_TL_PAUSE(ctx->dma_tl);
-    return ret;
+    if (ret == XMA_SUCCESS) {
+        labuf->xvbmBuf = b_handle;
+    } else {
+        xvbm_buffer_pool_entry_free(b_handle);
+        labuf->xvbmBuf = NULL;
+        xma_logmsg(XMA_ERROR_LOG, XMA_LA_PLUGIN,
+                   "Error: (%s) DMA to device failed", __func__);
+    }
 
+    return ret;
 }
 
 static int prepare_n_push_ready_buf(xlnx_la_t *ctx,
@@ -1066,7 +1129,46 @@ static int prepare_n_push_ready_buf(xlnx_la_t *ctx,
     }
     memRes->cur_ready_buf = la_buf;
     if (frame) {
+        XmaSideDataHandle *side_data = la_buf->xFrame.side_data;
         memcpy(&la_buf->xFrame, frame, sizeof (XmaFrame));
+        la_buf->xFrame.side_data = side_data;
+
+        XmaSideDataHandle dynparam_sd = xma_frame_get_side_data(frame, XMA_FRAME_DYNAMIC_PARAMS);
+        if(dynparam_sd) {
+            xlnx_dyn_param_t *dynparam_ptr = (xlnx_dyn_param_t *)xma_side_data_get_buffer(dynparam_sd);
+            if(dynparam_ptr->la_dyn_param.is_spatial_mode_changed) {
+                ctx->spatial_aq_mode = dynparam_ptr->la_dyn_param.spatial_aq_mode;
+            }
+            if(dynparam_ptr->la_dyn_param.is_temporal_mode_changed) {
+                ctx->temporal_aq_mode = dynparam_ptr->la_dyn_param.temporal_aq_mode;
+            }
+            if(dynparam_ptr->la_dyn_param.is_spatial_gain_changed) {
+                ctx->spatial_aq_gain = dynparam_ptr->la_dyn_param.spatial_aq_gain;
+            }
+            if(dynparam_ptr->enc_dyn_param.is_bframes_changed) {
+                ctx->num_b_frames = dynparam_ptr->enc_dyn_param.num_b_frames;
+            }
+
+            ctx->qpmap_cfg.spatial_aq_mode = ctx->spatial_aq_mode;
+            ctx->qpmap_cfg.temporal_aq_mode = ctx->temporal_aq_mode;
+            ctx->qpmap_cfg.spatial_aq_gain = ctx->spatial_aq_gain;
+            ctx->qpmap_cfg.num_b_frames = ctx->num_b_frames;
+            XmaSideDataHandle dynparam_handle = xma_side_data_alloc(dynparam_ptr, 
+                                           XMA_FRAME_DYNAMIC_PARAMS, sizeof(xlnx_enc_dyn_Param_t), 0);
+            xma_frame_add_side_data(&la_buf->xFrame, dynparam_handle);
+            xma_side_data_dec_ref(dynparam_handle);
+            xma_frame_remove_side_data_type(frame, XMA_FRAME_DYNAMIC_PARAMS);
+        }
+        LOCK_CFG;
+        update_aq_modes(ctx->qp_handle, &ctx->qpmap_cfg);
+        UNLOCK_CFG;
+
+        XmaSideDataHandle hdr_sd = xma_frame_get_side_data(frame, XMA_FRAME_HDR);
+        if(hdr_sd) {
+            xma_frame_add_side_data(&la_buf->xFrame, hdr_sd);
+            xma_frame_remove_side_data(frame, hdr_sd);
+        }
+
         if (ctx->enableHwInBuf) {
             la_buf->xvbmBuf = (XvbmBufferHandle)(frame->data[0].buffer);
             la_buf->pHost = (uint8_t *)xvbm_buffer_get_host_ptr(la_buf->xvbmBuf);
@@ -1081,8 +1183,11 @@ static int prepare_n_push_ready_buf(xlnx_la_t *ctx,
             }
             la_buf->xFrame.data[0].buffer = la_buf->xvbmBuf;
             la_buf->xFrame.data[0].buffer_type = XMA_DEVICE_BUFFER_TYPE;
-            la_buf->xFrame.frame_props.format = XMA_VCU_NV12_FMT_TYPE;
+            la_buf->xFrame.frame_props.format = ctx->in_frame_format;
             la_buf->xFrame.frame_props.linesize[0] = ctx->vcu_aligned_width;
+            //@TODO remove this dirty hack
+            // This is required for the downstream componen to know the chroma offset
+            la_buf->xFrame.frame_props.linesize[1] = ctx->vcu_aligned_height;
             xvbm_buffer_refcnt_inc(la_buf->xvbmBuf);
         }
         la_buf->paddr = (uint64_t) xvbm_buffer_get_paddr(la_buf->xvbmBuf);
@@ -1127,9 +1232,9 @@ static int extend_input_bufpool(XvbmBufferHandle b_handle,
 }
 
 static int32_t xma_la_send_frame(XmaFilterSession *sess,
-                                 XmaFrame         *frame)
+                                 XmaFrame *frame)
 {
-    xlnx_la_t *ctx = sess->base.plugin_data;
+    xlnx_la_t         *ctx    = sess->base.plugin_data;
     xlnx_la_mem_res_t *memRes = &ctx->la_bufs;
 
     if (ctx->inEOS) {
@@ -1200,6 +1305,9 @@ static int32_t xma_la_send_frame(XmaFilterSession *sess,
                 }
             }
             ctx->bufpool_ext_req = 0;
+            if (frame->frame_props.linesize[0] != ctx->vcu_aligned_width) {
+                ctx->vcu_aligned_width = frame->frame_props.linesize[0];
+            }
         }
         RET_IF_ERR(prepare_n_push_ready_buf, ctx, frame);
         if (frame->is_last_frame) {
@@ -1290,6 +1398,22 @@ static int32_t xma_la_recv_data(XmaFilterSession *sess,
     XmaSideDataHandle *side_data = frame->side_data;
     memcpy (frame, &outBuf->xFrame, sizeof (XmaFrame));
     frame->side_data = side_data;
+
+    XmaSideDataHandle dynparam_sd = xma_frame_get_side_data(&outBuf->xFrame, XMA_FRAME_DYNAMIC_PARAMS);
+    if(dynparam_sd) {
+        xma_frame_add_side_data(frame, dynparam_sd);
+    }
+
+    XmaSideDataHandle hdr_sd = xma_frame_get_side_data(&outBuf->xFrame, XMA_FRAME_HDR);
+    if(hdr_sd) {
+        xma_frame_add_side_data(frame, hdr_sd);
+    }
+
+    /* Clear out the side data in the intermediate xmaframe */
+    if(dynparam_sd || hdr_sd) {
+        xma_frame_clear_all_side_data(&outBuf->xFrame);
+    }
+
     if (outBuf->xvbmBuf) {
         xvbm_buffer_pool_entry_free(outBuf->xvbmBuf);
     }
@@ -1420,8 +1544,9 @@ static xlnx_thread_func_ret_t krnl_driver(xlnx_thread_func_args_t  args)
         return ret;
     }
 
-
+    LOCK_CFG;
     ret = process_last_output(sess);
+    UNLOCK_CFG;
     if (ret != ERetRunAgain) {
         XLNX_TL_PAUSE(ctx->krnl_thread_tl);
         if (ret == ERetError) {
@@ -1446,6 +1571,7 @@ static int32_t xma_la_close(XmaFilterSession *sess)
 {
     xlnx_la_t *ctx = sess->base.plugin_data;
     cleanup_krnl_driver_thread(sess);
+    pthread_mutex_destroy(&ctx->cfg_lock);
 
     char strbuf[512];
     if (ctx->la_plg_tl) {
@@ -1503,3 +1629,4 @@ XmaFilterPlugin filter_plugin = {
     .close = xma_la_close,
     .xma_version = xma_la_version
 };
+

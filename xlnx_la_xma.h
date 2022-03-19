@@ -38,6 +38,27 @@
 extern "C" {
 #endif
 
+typedef struct xlnx_la_dyn_param {
+    bool is_spatial_gain_changed;
+    uint32_t spatial_aq_gain;
+    bool is_temporal_mode_changed;
+    bool temporal_aq_mode;
+    bool is_spatial_mode_changed;
+    bool spatial_aq_mode;
+}xlnx_la_dyn_param_t;
+
+typedef struct xlnx_enc_dyn_Param {
+    bool is_bitrate_changed;
+    uint32_t bit_rate;
+    bool is_bframes_changed;
+    uint8_t num_b_frames;
+} xlnx_enc_dyn_Param_t;
+
+typedef struct xlnx_dyn_param {
+    xlnx_enc_dyn_Param_t enc_dyn_param;
+    xlnx_la_dyn_param_t la_dyn_param;
+} xlnx_dyn_param_t;
+ 
 typedef struct xlnx_la_buf
 {
     XmaFrame         xFrame;
@@ -46,6 +67,12 @@ typedef struct xlnx_la_buf
     uint8_t          *pHost;
     uint64_t         size;
 } xlnx_la_buf_t;
+
+typedef enum
+{
+    EBPCMode8,
+    EBPCMode10
+} xlnx_la_bpc_mode_t;
 
 typedef struct xlnx_la_mem_res
 {
@@ -76,7 +103,8 @@ typedef struct xlnx_la
     uint32_t vcu_aligned_height;
     uint32_t actual_mb_w;
     uint32_t actual_mb_h;
-    uint32_t stride;
+    uint32_t in_stride;
+    xlnx_la_bpc_mode_t bpc_mode;
     uint32_t intraPeriod;
     uint32_t write_mv;
     uint32_t in_frame;
@@ -102,10 +130,11 @@ typedef struct xlnx_la
     uint64_t frame_num;
     uint8_t eos_received;
     uint8_t inEOS;
+    pthread_mutex_t cfg_lock;
     xlnx_time_logger_t la_plg_tl;
     xlnx_time_logger_t dma_tl;
     xlnx_time_logger_t krnl_thread_tl;
-    uint8_t ctrl[MOT_EST_CTRL_SIZE];
+    uint8_t ctrl[XV_MOT_EST_CTRL_SIZE];
     size_t use_out_length;
 #ifdef ENABLE_YUV_DUMP
     FILE *inFile;
@@ -115,6 +144,8 @@ typedef struct xlnx_la
     struct timespec latency;
     long long int time_taken;
     uint32_t is_first_ref_frame;
+    int32_t is_idr;
+    XmaFormatType in_frame_format;
 } xlnx_la_t;
 
 #ifdef __cplusplus

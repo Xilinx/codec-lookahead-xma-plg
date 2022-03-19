@@ -51,8 +51,8 @@
 
 #define XLNX_MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
 
-#define VCU_STRIDE_ALIGN 256
-#define VCU_HEIGHT_ALIGN 64
+#define VCU_STRIDE_ALIGN 32
+#define VCU_HEIGHT_ALIGN 32
 
 #endif //XLNX_LA_DEFINES_H
 

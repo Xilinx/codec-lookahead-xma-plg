@@ -1,7 +1,7 @@
-/*       
+/*
  * Copyright (C) 2019, Xilinx Inc - All rights reserved
- * Xilinx Lookahead XMA Plugin 
- *                                    
+ * Xilinx Lookahead XMA Plugin
+ *
  * Licensed under the Apache License, Version 2.0 (the "License"). You may
  * not use this file except in compliance with the License. A copy of the
  * License is located at
@@ -11,9 +11,9 @@
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
  * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
- * License for the specific language governing permissions and limitations 
+ * License for the specific language governing permissions and limitations
  * under the License.
- */        
+ */
 // ==============================================================
 // ctrl
 // 0x00 : Control signals
@@ -79,33 +79,38 @@
 // 0x7c : Data signal of act_V
 //        bit 31~0 - act_V[63:32] (Read/Write)
 // 0x80 : reserved
+// 0x84 : Data signal of pixFmt
+//        bit 31~0 - pixFmt[31:0] (Read/Write)
+// 0x88 : reserved
 // (SC = Self Clear, COR = Clear on Read, TOW = Toggle on Write, COH = Clear on Handshake)
 
-#define ADDR_AP_CTRL                0x00
-#define ADDR_GIE                    0x04
-#define ADDR_IER                    0x08
-#define ADDR_ISR                    0x0c
-#define ADDR_WIDTH_DATA             0x10
-#define BITS_WIDTH_DATA             32
-#define ADDR_HEIGHT_DATA            0x18
-#define BITS_HEIGHT_DATA            32
-#define ADDR_STRIDE_DATA            0x20
-#define BITS_STRIDE_DATA            32
-#define ADDR_WRITE_MV_DATA          0x28
-#define BITS_WRITE_MV_DATA          32
-#define ADDR_FRM_BUFFER_REF_V_DATA  0x30
-#define BITS_FRM_BUFFER_REF_V_DATA  64
-#define ADDR_FRM_BUFFER_SRCH_V_DATA 0x3c
-#define BITS_FRM_BUFFER_SRCH_V_DATA 64
-#define ADDR_SAD_V_DATA             0x48
-#define BITS_SAD_V_DATA             64
-#define ADDR_MV_V_DATA              0x54
-#define BITS_MV_V_DATA              64
-#define ADDR_SKIP_L2_DATA           0x60
-#define BITS_SKIP_L2_DATA           32
-#define ADDR_VAR_V_DATA             0x6c
-#define BITS_VAR_V_DATA             64
-#define ADDR_ACT_V_DATA             0x78
-#define BITS_ACT_V_DATA             64
-#define MOT_EST_CTRL_SIZE           0x84
+#define XV_MOT_EST_CTRL_ADDR_AP_CTRL                0x00
+#define XV_MOT_EST_CTRL_ADDR_GIE                    0x04
+#define XV_MOT_EST_CTRL_ADDR_IER                    0x08
+#define XV_MOT_EST_CTRL_ADDR_ISR                    0x0c
+#define XV_MOT_EST_CTRL_ADDR_WIDTH_DATA             0x10
+#define XV_MOT_EST_CTRL_BITS_WIDTH_DATA             32
+#define XV_MOT_EST_CTRL_ADDR_HEIGHT_DATA            0x18
+#define XV_MOT_EST_CTRL_BITS_HEIGHT_DATA            32
+#define XV_MOT_EST_CTRL_ADDR_STRIDE_DATA            0x20
+#define XV_MOT_EST_CTRL_BITS_STRIDE_DATA            32
+#define XV_MOT_EST_CTRL_ADDR_WRITE_MV_DATA          0x28
+#define XV_MOT_EST_CTRL_BITS_WRITE_MV_DATA          32
+#define XV_MOT_EST_CTRL_ADDR_FRM_BUFFER_REF_V_DATA  0x30
+#define XV_MOT_EST_CTRL_BITS_FRM_BUFFER_REF_V_DATA  64
+#define XV_MOT_EST_CTRL_ADDR_FRM_BUFFER_SRCH_V_DATA 0x3c
+#define XV_MOT_EST_CTRL_BITS_FRM_BUFFER_SRCH_V_DATA 64
+#define XV_MOT_EST_CTRL_ADDR_SAD_V_DATA             0x48
+#define XV_MOT_EST_CTRL_BITS_SAD_V_DATA             64
+#define XV_MOT_EST_CTRL_ADDR_MV_V_DATA              0x54
+#define XV_MOT_EST_CTRL_BITS_MV_V_DATA              64
+#define XV_MOT_EST_CTRL_ADDR_SKIP_L2_DATA           0x60
+#define XV_MOT_EST_CTRL_BITS_SKIP_L2_DATA           32
+#define XV_MOT_EST_CTRL_ADDR_VAR_V_DATA             0x6c
+#define XV_MOT_EST_CTRL_BITS_VAR_V_DATA             64
+#define XV_MOT_EST_CTRL_ADDR_ACT_V_DATA             0x78
+#define XV_MOT_EST_CTRL_BITS_ACT_V_DATA             64
+#define XV_MOT_EST_CTRL_ADDR_PIXFMT_DATA            0x84
+#define XV_MOT_EST_CTRL_BITS_PIXFMT_DATA            32
+#define XV_MOT_EST_CTRL_SIZE                        0x88
 
