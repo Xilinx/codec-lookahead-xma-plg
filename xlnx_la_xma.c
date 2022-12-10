@@ -18,6 +18,7 @@
 #include <string.h>
 #include <syslog.h>
 #include <pthread.h>
+#include <unistd.h>
 #include "xlnx_la_xma.h"
 #include "xlnx_la_plg_ext.h"
 #include "krnl_mot_est_hw.h"
@@ -40,7 +41,8 @@ static const char *XLNX_LA_EXT_PARAMS[] = {
     "spatial_aq_gain",
     "num_b_frames",
     "codec_type",
-    "latency_logging"
+    "latency_logging",
+    "dynamic_gop"
 };
 
 static int32_t xma_release_mem_res(XmaFilterSession *sess);
@@ -221,9 +223,9 @@ static size_t setOutBufSize(xlnx_la_t *ctx, xlnx_la_mem_res_t *memRes,
     Bpb = 4;
     totalSize += xlnx_align_to_base(num_b * Bpb, LINMEM_ALIGN_4K);
     //MV
-    *length = totalSize;
     memRes->mv_off = totalSize;
     totalSize += xlnx_align_to_base(num_b * Bpb, LINMEM_ALIGN_4K);
+    *length = totalSize;
     return totalSize;
 }
 
@@ -507,7 +509,7 @@ static int32_t xma_la_init(XmaFilterSession *sess)
 
     ctx->in_frame = 0;
     ctx->out_frame = 0;
-    ctx->write_mv = 0;
+    ctx->write_mv = 1;
     if ((ctx->width >= MAX_HOR_RES) && (ctx->height >= MAX_VERT_RES)) {
         ctx->skip_l2 = 0;
     } else {
@@ -521,6 +523,7 @@ static int32_t xma_la_init(XmaFilterSession *sess)
     ctx->spatial_aq_gain = XLNX_DEFAULT_SPATIAL_AQ_GAIN;
     ctx->temporal_aq_mode = XLNX_DEFAULT_TEMPORAL_AQ_MODE;
     ctx->num_b_frames = XLNX_DEFAULT_NUM_OF_B_FRAMES;
+    ctx->dynamic_gop = XLNX_DEFAULT_DYNAMIC_GOP;
     ctx->codec_type = XLNX_DEFAULT_CODEC_TYPE;
     ctx->rate_control_mode = XLNX_DEFAULT_RATE_CONTROL_MODE;
     ctx->latency_logging = XLNX_DEFAULT_LATENCY_LOGGING;
@@ -661,8 +664,21 @@ static int32_t xma_la_init(XmaFilterSession *sess)
                            "xma_la_init: Set ext param %s = %u", extParam->name,
                            ctx->latency_logging);
                 break;
+            case EParamDynamicGop:
+                if ((extParam->type != XMA_UINT32) ||
+                        strcmp(extParam->name, XLNX_LA_EXT_PARAMS[EParamDynamicGop])) {
+                    xma_logmsg(XMA_ERROR_LOG, XMA_LA_PLUGIN,
+                               "xma_la_init: Ext Param %s of type %d Invalid", extParam->name,
+                               extParam->type);
+                    return -1;
+                }
+                ctx->dynamic_gop = *((uint32_t *)extParam->value);
+                xma_logmsg(XMA_DEBUG_LOG, XMA_LA_PLUGIN,
+                           "xma_la_init: Set ext param %s = %u", extParam->name,
+                           ctx->dynamic_gop);
+                break;
             default:
-                xma_logmsg(XMA_ERROR_LOG, XMA_LA_PLUGIN,
+                xma_logmsg(XMA_WARNING_LOG, XMA_LA_PLUGIN,
                            "xma_la_init: Unknown ext Param %s ignored", extParam->name);
                 break;
         }
@@ -677,7 +693,11 @@ static int32_t xma_la_init(XmaFilterSession *sess)
     } else {
         ctx->qpmap_out_size = ctx->qpmap_size;
     }
-
+    
+    // initialize b_frames
+    for(int32_t i = 0; i < 6; i++) {
+        ctx->bframes[i] = ctx->num_b_frames;
+    }
     //printf("qpmap_size=%u\n\n", ctx->qpmap_size);
     ctx->num_mb = ((filter_props->output.width * filter_props->output.height)/
                    (BLOCK_WIDTH * BLOCK_HEIGHT));
@@ -923,13 +943,12 @@ static void set_frame_stats(xlnx_la_t *ctx, xlnx_frame_stats *stats,
                             const uint16_t *sad, const uint32_t *var,
                             const uint16_t *act, const uint32_t *mv)
 {
-    (void)mv;
+    //(void)mv;
     stats->mv = NULL;
     stats->sad = NULL;
     stats->var = NULL;
     stats->act = NULL;
     stats->num_blocks = ctx->num_mb;
-    stats->mv = NULL;
 
     stats->var = var;
     if (ctx->spatial_aq_mode == XLNX_AQ_SPATIAL_ACTIVITY) {
@@ -941,6 +960,54 @@ static void set_frame_stats(xlnx_la_t *ctx, xlnx_frame_stats *stats,
     }
 
     stats->sad = sad;
+	stats->mv = mv;
+}
+
+/**
+ * @brief Update the num b frames dynamically by utilizing motion vector data.
+ * frame complexity: 0= low, 1=med, 2= high
+ * 
+ * @param ctx 
+ * @return int 0 success / -1 failure
+ */
+static int dynamic_gop_update_b_frames(xlnx_la_t *ctx) {
+    // Update for every fourth frame.
+    if (ctx->frame_num <= 0 || ctx->frame_num % XLNX_DYNAMIC_GOP_INTERVAL != (XLNX_DYNAMIC_GOP_INTERVAL - 1)) {
+        return 0;
+    }
+    int32_t b_frames = 1;
+    int32_t countLow = 0, countHigh = 0;
+    
+    for (int it = 0; it < XLNX_DYNAMIC_GOP_INTERVAL; it++) {
+        if (ctx->frame_complexity[it] == LOW_MOTION)
+            countLow = countLow + 1;
+        if (ctx->frame_complexity[it] == HIGH_MOTION)
+            countHigh = countHigh + 1;
+    }
+
+    b_frames = 1;
+    if (ctx->codec_type == EXlnxAvc) {
+
+        if (countLow == 4) { // all frames are low motion
+            b_frames = 2;
+        }
+        else if (countHigh >= 1) { //  atleast one of the frames is high motion
+            b_frames = 0;
+        }
+    }
+    else { // codec_type = EXlnxHevc
+
+        if (countLow >= 2) { // atleast 2 frames are low motion
+            b_frames = 2;
+        }
+        else if (countHigh == 4) { //  all frames are high motion
+            b_frames = 0;
+        }
+    }
+
+    ctx->bframes[(ctx->frame_num/XLNX_DYNAMIC_GOP_INTERVAL)%XLNX_DYNAMIC_GOP_CACHE] = b_frames;
+    ctx->qpmap_cfg.num_b_frames = b_frames;
+    return 0;
 }
 
 static xlnx_thread_func_ret_t process_last_output(XmaFilterSession *sess)
@@ -959,7 +1026,8 @@ static xlnx_thread_func_ret_t process_last_output(XmaFilterSession *sess)
             set_frame_stats(ctx, &stats, NULL,
                             NULL,
                             NULL, NULL);
-            if(send_frame_stats(ctx->qp_handle, ctx->frame_num+1, NULL, 1, ctx->is_idr) == EXlnxError) {
+            if(send_frame_stats(ctx->qp_handle, ctx->dynamic_gop, ctx->frame_num+1, NULL, 1, 
+                ctx->is_idr) == EXlnxError) {
                 return ERetError;
             }
             pump_out_qpmaps(ctx, ctx->frame_num+1);
@@ -982,11 +1050,25 @@ static xlnx_thread_func_ret_t process_last_output(XmaFilterSession *sess)
     set_frame_stats(ctx, &stats,
                     (uint16_t *)host_buf,
                     (uint32_t *)(host_buf + memRes->var_off),
-                    (uint16_t *)(host_buf + memRes->act_off), NULL);
-    if(send_frame_stats(ctx->qp_handle, ctx->frame_num, &stats,
+                    (uint16_t *)(host_buf + memRes->act_off), (uint32_t*)(host_buf + memRes->mv_off));
+
+    if(ctx->dynamic_gop) {
+        if (stats.mv != NULL) {
+            xlnx_status ret = EXlnxSuccess;
+            ret = generate_mv_histogram(ctx->qp_handle, ctx->frame_num, stats.mv, isLastFrameStat,
+                &ctx->frame_complexity[ctx->frame_num % XLNX_DYNAMIC_GOP_INTERVAL], ctx->is_idr);
+            if ((ret != EXlnxSuccess) && !isLastFrameStat) {
+                return ERetError;
+            }
+        }
+        dynamic_gop_update_b_frames(ctx);
+    }
+
+    if(send_frame_stats(ctx->qp_handle, ctx->dynamic_gop, ctx->frame_num, &stats,
                      isLastFrameStat, ctx->is_idr) == EXlnxError) {
         return ERetError;
     }
+
     pump_out_qpmaps(ctx, ctx->frame_num);
     ctx->frame_num++;
     PushQ(memRes->freeStatsBufQ, &last_stats_buf);
@@ -1146,13 +1228,21 @@ static int prepare_n_push_ready_buf(xlnx_la_t *ctx,
                 ctx->spatial_aq_gain = dynparam_ptr->la_dyn_param.spatial_aq_gain;
             }
             if(dynparam_ptr->enc_dyn_param.is_bframes_changed) {
-                ctx->num_b_frames = dynparam_ptr->enc_dyn_param.num_b_frames;
+                if(ctx->dynamic_gop) {
+                    xma_logmsg(XMA_WARNING_LOG, XMA_LA_PLUGIN,
+                               "Run time change in B frames from application is not allowed when"
+                               " dynamic GOP is enabled. Discarding the runtime B frame change");
+                    dynparam_ptr->enc_dyn_param.is_bframes_changed = 0;
+                }
+                else {
+                    ctx->num_b_frames = dynparam_ptr->enc_dyn_param.num_b_frames;
+                    ctx->qpmap_cfg.num_b_frames = ctx->num_b_frames;
+                }
             }
 
             ctx->qpmap_cfg.spatial_aq_mode = ctx->spatial_aq_mode;
             ctx->qpmap_cfg.temporal_aq_mode = ctx->temporal_aq_mode;
             ctx->qpmap_cfg.spatial_aq_gain = ctx->spatial_aq_gain;
-            ctx->qpmap_cfg.num_b_frames = ctx->num_b_frames;
             XmaSideDataHandle dynparam_handle = xma_side_data_alloc(dynparam_ptr, 
                                            XMA_FRAME_DYNAMIC_PARAMS, sizeof(xlnx_enc_dyn_Param_t), 0);
             xma_frame_add_side_data(&la_buf->xFrame, dynparam_handle);
@@ -1349,6 +1439,25 @@ static int32_t xma_la_recv_data(XmaFilterSession *sess,
                "%p : xma_la_recv_data IN", ctx);
     XLNX_TL_START(ctx->la_plg_tl);
 
+    /* This check makes sure the input and output frame difference is at least
+       4 when dynamic GOP is enabled. */
+    if(ctx->dynamic_gop) {
+        if((ctx->inEOS == 0) && ((ctx->frame_num - ctx->out_frame) < XLNX_DYNAMIC_GOP_INTERVAL)
+           && !isEmptyTSQ(memRes->freeHwInBufQ)) {
+            xma_logmsg(XMA_DEBUG_LOG, XMA_LA_PLUGIN,
+                    "%p : xma_la_recv_data dynamic GOP needs atleast 4 frames difference between input and output",
+                    ctx);
+            return XMA_SEND_MORE_DATA;
+        }
+
+        /* This while loop makes sure the updated dynamic B frames will be sent
+           to the encoder */
+        while((ctx->inEOS == 0) && ((ctx->frame_num - ctx->out_frame) < XLNX_DYNAMIC_GOP_INTERVAL)) {
+            usleep(50);
+        }
+
+    }
+
     if (isEmptyTSQ(memRes->readyVQInfoQ)) {
         xma_logmsg(XMA_DEBUG_LOG, XMA_LA_PLUGIN,
                    "%p : xma_la_recv_data QpMap not ready, in frames=%u, out frames=%u, ctx->inEOS=%u",
@@ -1399,14 +1508,39 @@ static int32_t xma_la_recv_data(XmaFilterSession *sess,
     memcpy (frame, &outBuf->xFrame, sizeof (XmaFrame));
     frame->side_data = side_data;
 
-    XmaSideDataHandle dynparam_sd = xma_frame_get_side_data(&outBuf->xFrame, XMA_FRAME_DYNAMIC_PARAMS);
-    if(dynparam_sd) {
-        xma_frame_add_side_data(frame, dynparam_sd);
-    }
-
     XmaSideDataHandle hdr_sd = xma_frame_get_side_data(&outBuf->xFrame, XMA_FRAME_HDR);
     if(hdr_sd) {
         xma_frame_add_side_data(frame, hdr_sd);
+    }
+
+    XmaSideDataHandle dynparam_sd = xma_frame_get_side_data(&outBuf->xFrame, XMA_FRAME_DYNAMIC_PARAMS);
+
+    /* If dynamic GOP and dynamic params(except B frames) are enabled, copy
+       the dynamic params to the new side data structure created for dynamic
+       GOP and send it to the encoder */
+    if(!((ctx->frame_num - ctx->out_frame) < XLNX_DYNAMIC_GOP_INTERVAL) &&
+        (ctx->dynamic_gop) && (ctx->out_frame%XLNX_DYNAMIC_GOP_INTERVAL == 0) &&
+        (ctx->bframes[(ctx->out_frame/XLNX_DYNAMIC_GOP_INTERVAL)%XLNX_DYNAMIC_GOP_CACHE] != ctx->num_b_frames)) {
+
+        ctx->num_b_frames = ctx->bframes[(ctx->out_frame/XLNX_DYNAMIC_GOP_INTERVAL)%XLNX_DYNAMIC_GOP_CACHE];
+        xlnx_enc_dyn_Param_t dynparam_ptr;
+        memset(&dynparam_ptr, 0, sizeof(xlnx_enc_dyn_Param_t));
+
+        /* Copy the dynamic encoder params to the new side data handle
+           created for dynamic GOP */
+        if(dynparam_sd) {
+            xlnx_enc_dyn_Param_t *in_dyn_param_ptr = (xlnx_enc_dyn_Param_t *)xma_side_data_get_buffer(dynparam_sd);
+            memcpy(&dynparam_ptr, in_dyn_param_ptr, sizeof(xlnx_enc_dyn_Param_t));
+        }
+        dynparam_ptr.num_b_frames = ctx->num_b_frames;
+        dynparam_ptr.is_bframes_changed = 1;
+        XmaSideDataHandle dynparam_handle = xma_side_data_alloc(&dynparam_ptr, 
+                                        XMA_FRAME_DYNAMIC_PARAMS, sizeof(xlnx_enc_dyn_Param_t), 0);
+        xma_frame_add_side_data(frame, dynparam_handle);
+        xma_side_data_dec_ref(dynparam_handle);
+
+    } else if(dynparam_sd) {
+        xma_frame_add_side_data(frame, dynparam_sd);
     }
 
     /* Clear out the side data in the intermediate xmaframe */

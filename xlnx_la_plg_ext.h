@@ -30,7 +30,8 @@ typedef enum
     EParamSpatialAQGain,
     EParamNumBFrames,
     EParamCodecType,
-    EParamLatencyLogging
+    EParamLatencyLogging,
+    EParamDynamicGop
 } xlnx_la_ext_params_t;
 
 typedef enum

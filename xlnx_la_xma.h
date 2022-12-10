@@ -52,13 +52,16 @@ typedef struct xlnx_enc_dyn_Param {
     uint32_t bit_rate;
     bool is_bframes_changed;
     uint8_t num_b_frames;
+    bool     is_min_max_qp_changed;
+    uint32_t min_qp;
+    uint32_t max_qp;
 } xlnx_enc_dyn_Param_t;
 
 typedef struct xlnx_dyn_param {
     xlnx_enc_dyn_Param_t enc_dyn_param;
     xlnx_la_dyn_param_t la_dyn_param;
 } xlnx_dyn_param_t;
- 
+
 typedef struct xlnx_la_buf
 {
     XmaFrame         xFrame;
@@ -117,6 +120,9 @@ typedef struct xlnx_la
     uint32_t temporal_aq_mode;
     uint32_t rate_control_mode;
     uint32_t num_b_frames;
+    uint32_t dynamic_gop;
+    uint32_t bframes[XLNX_DYNAMIC_GOP_CACHE];
+    uint32_t frame_complexity[XLNX_DYNAMIC_GOP_INTERVAL];
     xlnx_codec_type_t codec_type;
     uint32_t latency_logging;
     uint8_t bufpool_ext_req;
